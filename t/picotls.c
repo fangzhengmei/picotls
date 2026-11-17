@@ -3070,6 +3070,492 @@ static void test_handshake_api(void)
     ctx_peer->max_early_data_size = 0;
 }
 
+/**
+ * Records every invocation of `update_traffic_key`, retaining the order as well as the values of the secrets. Unlike
+ * `on_update_traffic_key`, this recorder does not assert that a key is installed only once; tests are responsible for asserting
+ * that a replayed message does not install an additional key.
+ */
+struct st_test_traffic_key_event {
+    int is_enc;
+    size_t epoch;
+    uint8_t secret[PTLS_MAX_DIGEST_SIZE];
+};
+
+struct st_test_traffic_key_log {
+    struct st_test_traffic_key_event events[16];
+    size_t num_events;
+};
+
+static int on_update_traffic_key_record(ptls_update_traffic_key_t *self, ptls_t *tls, int is_enc, size_t epoch, const void *secret)
+{
+    struct st_test_traffic_key_log *log = *ptls_get_data_ptr(tls);
+
+    if (log->num_events >= PTLS_ELEMENTSOF(log->events)) {
+        ok(!"too many update_traffic_key callbacks");
+        return PTLS_ALERT_INTERNAL_ERROR;
+    }
+
+    struct st_test_traffic_key_event *ev = log->events + log->num_events++;
+    ev->is_enc = is_enc;
+    ev->epoch = epoch;
+    memcpy(ev->secret, secret, ptls_get_cipher(tls)->hash->digest_size);
+    return 0;
+}
+
+static size_t test_traffic_key_log_count(struct st_test_traffic_key_log *log, int is_enc, size_t epoch)
+{
+    size_t count = 0;
+
+    for (size_t i = 0; i != log->num_events; ++i)
+        if (log->events[i].is_enc == is_enc && log->events[i].epoch == epoch)
+            ++count;
+    return count;
+}
+
+static const uint8_t *test_traffic_key_log_find(struct st_test_traffic_key_log *log, int is_enc, size_t epoch)
+{
+    for (size_t i = 0; i != log->num_events; ++i)
+        if (log->events[i].is_enc == is_enc && log->events[i].epoch == epoch)
+            return log->events[i].secret;
+    return NULL;
+}
+
+#define OK_KEY_INSTALLED(log, is_enc, epoch) ok(test_traffic_key_log_count(&(log), (is_enc), (epoch)) == 1)
+#define OK_KEY_ABSENT(log, is_enc, epoch) ok(test_traffic_key_log_count(&(log), (is_enc), (epoch)) == 0)
+#define OK_KEY_MATCH(log1, is_enc1, epoch1, log2, is_enc2, epoch2)                                                                 \
+    do {                                                                                                                           \
+        const uint8_t *_key1 = test_traffic_key_log_find(&(log1), (is_enc1), (epoch1));                                            \
+        const uint8_t *_key2 = test_traffic_key_log_find(&(log2), (is_enc2), (epoch2));                                            \
+        ok(_key1 != NULL && _key2 != NULL && memcmp(_key1, _key2, PTLS_MAX_DIGEST_SIZE) == 0);                                     \
+    } while (0)
+
+struct st_epoch_test_env {
+    ptls_update_traffic_key_t *ctx_update_traffic_key_orig, *ctx_peer_update_traffic_key_orig;
+    unsigned ctx_omit_end_of_early_data_orig, ctx_peer_omit_end_of_early_data_orig;
+    ptls_t *client, *server;
+    struct st_test_traffic_key_log client_keys, server_keys;
+};
+
+static void epoch_test_env_init(struct st_epoch_test_env *env)
+{
+    static ptls_update_traffic_key_t update_traffic_key = {on_update_traffic_key_record};
+
+    env->ctx_update_traffic_key_orig = ctx->update_traffic_key;
+    env->ctx_peer_update_traffic_key_orig = ctx_peer->update_traffic_key;
+    env->ctx_omit_end_of_early_data_orig = ctx->omit_end_of_early_data;
+    env->ctx_peer_omit_end_of_early_data_orig = ctx_peer->omit_end_of_early_data;
+
+    ctx->update_traffic_key = &update_traffic_key;
+    ctx_peer->update_traffic_key = &update_traffic_key;
+    ctx->omit_end_of_early_data = 1;
+    ctx_peer->omit_end_of_early_data = 1;
+
+    memset(&env->client_keys, 0, sizeof(env->client_keys));
+    memset(&env->server_keys, 0, sizeof(env->server_keys));
+
+    env->client = ptls_new(ctx, 0);
+    ok(env->client != NULL);
+    env->server = ptls_new(ctx_peer, 1);
+    ok(env->server != NULL);
+    *ptls_get_data_ptr(env->client) = &env->client_keys;
+    *ptls_get_data_ptr(env->server) = &env->server_keys;
+}
+
+static void epoch_test_env_dispose(struct st_epoch_test_env *env)
+{
+    ptls_free(env->client);
+    ptls_free(env->server);
+
+    ctx->update_traffic_key = env->ctx_update_traffic_key_orig;
+    ctx_peer->update_traffic_key = env->ctx_peer_update_traffic_key_orig;
+    ctx->omit_end_of_early_data = env->ctx_omit_end_of_early_data_orig;
+    ctx_peer->omit_end_of_early_data = env->ctx_peer_omit_end_of_early_data_orig;
+}
+
+/**
+ * Resets the send buffer and the epoch offsets, then delivers one message. Applications are permitted to reset the two output
+ * arguments every time; doing so here makes each assertion observe the output of a single call.
+ */
+static int feed_single_message(ptls_t *tls, ptls_buffer_t *sendbuf, size_t epoch_offsets[5], size_t in_epoch, const void *input,
+                               size_t inlen, ptls_handshake_properties_t *properties)
+{
+    sendbuf->off = 0;
+    memset(epoch_offsets, 0, sizeof(size_t) * 5);
+    return ptls_handle_message(tls, sendbuf, epoch_offsets, in_epoch, input, inlen, properties);
+}
+
+static void ok_epoch_offsets(const size_t epoch_offsets[5], size_t buflen)
+{
+    ok(epoch_offsets[0] == 0);
+    ok(epoch_offsets[1] >= epoch_offsets[0]);
+    ok(epoch_offsets[2] >= epoch_offsets[1]);
+    ok(epoch_offsets[3] >= epoch_offsets[2]);
+    ok(epoch_offsets[4] >= epoch_offsets[3]);
+    ok(epoch_offsets[4] == buflen);
+}
+
+static int append_bytes(ptls_buffer_t *dst, const void *src, size_t len)
+{
+    int ret;
+
+    if ((ret = ptls_buffer_reserve(dst, len)) != 0)
+        return ret;
+    memcpy(dst->base + dst->off, src, len);
+    dst->off += len;
+    return 0;
+}
+
+/**
+ * Verifies the epoch transitions of an ordinary, fully ordered handshake driven through `ptls_handle_message`; i.e., the baseline
+ * that the reordering / replay tests below are compared against. Each transition also asserts that the keys installed so far are
+ * exactly those implied by `ptls_get_read_epoch`.
+ */
+static void test_handshake_api_epoch_transitions(void)
+{
+    struct st_epoch_test_env env;
+    ptls_buffer_t cbuf, sbuf;
+    size_t coffs[5], soffs[5];
+    int ret;
+
+    epoch_test_env_init(&env);
+    ptls_buffer_init(&cbuf, "", 0);
+    ptls_buffer_init(&sbuf, "", 0);
+
+    /* the client emits ClientHello without installing any key, and all of it belongs to epoch 0 */
+    ok(ptls_get_read_epoch(env.client) == 0);
+    ret = feed_single_message(env.client, &cbuf, coffs, 0, NULL, 0, NULL);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(cbuf.off != 0);
+    ok(ptls_get_read_epoch(env.client) == 0);
+    ok(env.client_keys.num_events == 0);
+    ok_epoch_offsets(coffs, cbuf.off);
+    ok(coffs[1] == cbuf.off);
+    ok(coffs[2] == cbuf.off);
+    ok(coffs[3] == cbuf.off);
+
+    /* the server consumes ClientHello: handshake keys in both directions and the application send key are installed, but the
+     * client's application read key must not be available until Finished is received */
+    ret = feed_single_message(env.server, &sbuf, soffs, 0, cbuf.base, cbuf.off, NULL);
+    ok(ret == 0);
+    ok(sbuf.off != 0);
+    ok(ptls_get_read_epoch(env.server) == 2);
+    ok(!ptls_handshake_is_complete(env.server));
+    OK_KEY_INSTALLED(env.server_keys, 0, 2);
+    OK_KEY_INSTALLED(env.server_keys, 1, 2);
+    OK_KEY_INSTALLED(env.server_keys, 1, 3);
+    OK_KEY_ABSENT(env.server_keys, 0, 3);
+    OK_KEY_ABSENT(env.server_keys, 0, 1);
+    OK_KEY_ABSENT(env.server_keys, 1, 1);
+    ok(env.server_keys.num_events == 3);
+    ok_epoch_offsets(soffs, sbuf.off);
+    ok(soffs[1] != 0);
+    ok(soffs[1] == soffs[2]); /* ServerHello alone occupies epoch 0 */
+    ok(soffs[2] < soffs[3]);  /* the rest of the flight is encrypted with the handshake key */
+    ok(soffs[3] == soffs[4]); /* nothing follows ServerFinished */
+
+    /* ServerHello moves the client's read epoch to 2 and installs the matching handshake keys */
+    ret = feed_single_message(env.client, &cbuf, coffs, 0, sbuf.base, soffs[1], NULL);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(ptls_get_read_epoch(env.client) == 2);
+    ok(!ptls_handshake_is_complete(env.client));
+    OK_KEY_INSTALLED(env.client_keys, 0, 2);
+    OK_KEY_INSTALLED(env.client_keys, 1, 2);
+    OK_KEY_ABSENT(env.client_keys, 0, 3);
+    OK_KEY_ABSENT(env.client_keys, 1, 3);
+    ok(env.client_keys.num_events == 2);
+    OK_KEY_MATCH(env.client_keys, 0, 2, env.server_keys, 1, 2);
+    OK_KEY_MATCH(env.client_keys, 1, 2, env.server_keys, 0, 2);
+
+    /* the remainder of the server flight is supplied at epoch 2; ClientFinished moves the client to epoch 3 */
+    ret = feed_single_message(env.client, &cbuf, coffs, 2, sbuf.base + soffs[2], soffs[4] - soffs[2], NULL);
+    ok(ret == 0);
+    ok(cbuf.off != 0);
+    ok(ptls_handshake_is_complete(env.client));
+    ok(ptls_get_read_epoch(env.client) == 3);
+    OK_KEY_INSTALLED(env.client_keys, 0, 3);
+    OK_KEY_INSTALLED(env.client_keys, 1, 3);
+    ok(env.client_keys.num_events == 4);
+    OK_KEY_MATCH(env.client_keys, 0, 3, env.server_keys, 1, 3);
+    ok_epoch_offsets(coffs, cbuf.off);
+    ok(coffs[1] == 0);
+    ok(coffs[2] == 0);
+    ok(coffs[3] == cbuf.off); /* ClientFinished is emitted at the handshake epoch */
+    ok(coffs[4] == cbuf.off);
+
+    /* ClientFinished completes the server side and yields the application read key */
+    ret = feed_single_message(env.server, &sbuf, soffs, 2, cbuf.base, cbuf.off, NULL);
+    ok(ret == 0);
+    ok(sbuf.off == 0);
+    ok(ptls_handshake_is_complete(env.server));
+    ok(ptls_get_read_epoch(env.server) == 3);
+    OK_KEY_INSTALLED(env.server_keys, 0, 3);
+    ok(env.server_keys.num_events == 4);
+    OK_KEY_MATCH(env.client_keys, 1, 3, env.server_keys, 0, 3);
+
+    /* every epoch in 1..3 carries at most one key per direction */
+    for (int is_enc = 0; is_enc != 2; ++is_enc) {
+        for (size_t epoch = 1; epoch != 4; ++epoch) {
+            ok(test_traffic_key_log_count(&env.client_keys, is_enc, epoch) <= 1);
+            ok(test_traffic_key_log_count(&env.server_keys, is_enc, epoch) <= 1);
+        }
+    }
+
+    ptls_buffer_dispose(&cbuf);
+    ptls_buffer_dispose(&sbuf);
+    epoch_test_env_dispose(&env);
+}
+
+/**
+ * Feeds messages out of order (i.e., at an epoch that is ahead of `ptls_get_read_epoch`), and splits messages both within a single
+ * epoch and across calls. Asserts that a rejected call neither advances the state nor installs a key, and that a split message
+ * installs its keys only once the message is complete.
+ */
+static void test_handshake_api_epoch_order(void)
+{
+    struct st_epoch_test_env env;
+    ptls_buffer_t cbuf, sbuf;
+    size_t coffs[5], soffs[5], ch_len, sh_len, flight_off, flight_len, cf_len, nkeys;
+    int ret;
+
+    epoch_test_env_init(&env);
+    ptls_buffer_init(&cbuf, "", 0);
+    ptls_buffer_init(&sbuf, "", 0);
+
+    ret = feed_single_message(env.client, &cbuf, coffs, 0, NULL, 0, NULL);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(cbuf.off != 0);
+    ch_len = cbuf.off;
+
+    /* ClientHello supplied at a future epoch is rejected without side effects */
+    nkeys = env.server_keys.num_events;
+    ret = feed_single_message(env.server, &sbuf, soffs, 1, cbuf.base, ch_len, NULL);
+    ok(ret == PTLS_ALERT_UNEXPECTED_MESSAGE);
+    ret = feed_single_message(env.server, &sbuf, soffs, 2, cbuf.base, ch_len, NULL);
+    ok(ret == PTLS_ALERT_UNEXPECTED_MESSAGE);
+    ok(env.server_keys.num_events == nkeys);
+    ok(ptls_get_read_epoch(env.server) == 0);
+    ok(!ptls_handshake_is_complete(env.server));
+
+    /* ClientHello is accepted as two fragments at epoch 0, and keys appear only after the message becomes complete */
+    ret = feed_single_message(env.server, &sbuf, soffs, 0, cbuf.base, ch_len / 2, NULL);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(ptls_get_read_epoch(env.server) == 0);
+    ok(env.server_keys.num_events == nkeys);
+    ok(!ptls_handshake_is_complete(env.server));
+    ret = feed_single_message(env.server, &sbuf, soffs, 0, cbuf.base + ch_len / 2, ch_len - ch_len / 2, NULL);
+    ok(ret == 0);
+    ok(ptls_get_read_epoch(env.server) == 2);
+    ok(env.server_keys.num_events == nkeys + 3);
+
+    sh_len = soffs[1];
+    flight_off = soffs[2];
+    flight_len = soffs[4] - soffs[2];
+    ok(sh_len != 0);
+    ok(sh_len == flight_off); /* the flight following ServerHello starts at epoch 2 */
+    ok(flight_len > 5);
+
+    /* the encrypted flight supplied at a future epoch is rejected, and does not hand out an epoch-3 key */
+    nkeys = env.client_keys.num_events;
+    ret = feed_single_message(env.client, &cbuf, coffs, 1, sbuf.base + flight_off, flight_len, NULL);
+    ok(ret == PTLS_ALERT_UNEXPECTED_MESSAGE);
+    ret = feed_single_message(env.client, &cbuf, coffs, 2, sbuf.base + flight_off, flight_len, NULL);
+    ok(ret == PTLS_ALERT_UNEXPECTED_MESSAGE);
+    ret = feed_single_message(env.client, &cbuf, coffs, 3, sbuf.base + flight_off, flight_len, NULL);
+    ok(ret == PTLS_ALERT_UNEXPECTED_MESSAGE);
+    ok(env.client_keys.num_events == nkeys);
+    ok(ptls_get_read_epoch(env.client) == 0);
+    ok(!ptls_handshake_is_complete(env.client));
+    ok(cbuf.off == 0);
+
+    /* ServerHello advances the read epoch to 2 */
+    ret = feed_single_message(env.client, &cbuf, coffs, 0, sbuf.base, sh_len, NULL);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(ptls_get_read_epoch(env.client) == 2);
+    ok(env.client_keys.num_events == 2);
+    OK_KEY_INSTALLED(env.client_keys, 0, 2);
+    OK_KEY_INSTALLED(env.client_keys, 1, 2);
+    OK_KEY_ABSENT(env.client_keys, 0, 3);
+    OK_KEY_ABSENT(env.client_keys, 1, 3);
+
+    /* the flight is accepted even when the first fragment ends in the middle of a message */
+    ret = feed_single_message(env.client, &cbuf, coffs, 2, sbuf.base + flight_off, 5, NULL);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(ptls_get_read_epoch(env.client) == 2);
+    ok(env.client_keys.num_events == 2);
+    ok(!ptls_handshake_is_complete(env.client));
+    ret = feed_single_message(env.client, &cbuf, coffs, 2, sbuf.base + flight_off + 5, flight_len - 5, NULL);
+    ok(ret == 0);
+    ok(ptls_handshake_is_complete(env.client));
+    ok(ptls_get_read_epoch(env.client) == 3);
+    ok(env.client_keys.num_events == 4);
+    OK_KEY_INSTALLED(env.client_keys, 0, 3);
+    OK_KEY_INSTALLED(env.client_keys, 1, 3);
+
+    /* ClientFinished is likewise split across two calls; the client application read key appears only on completion */
+    cf_len = cbuf.off;
+    ok(cf_len > 5);
+    nkeys = env.server_keys.num_events;
+    ret = feed_single_message(env.server, &sbuf, soffs, 2, cbuf.base, 5, NULL);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(ptls_get_read_epoch(env.server) == 2);
+    ok(env.server_keys.num_events == nkeys);
+    OK_KEY_ABSENT(env.server_keys, 0, 3);
+    ret = feed_single_message(env.server, &sbuf, soffs, 2, cbuf.base + 5, cf_len - 5, NULL);
+    ok(ret == 0);
+    ok(ptls_handshake_is_complete(env.server));
+    ok(ptls_get_read_epoch(env.server) == 3);
+    ok(env.server_keys.num_events == nkeys + 1);
+    OK_KEY_INSTALLED(env.server_keys, 0, 3);
+    OK_KEY_MATCH(env.client_keys, 1, 3, env.server_keys, 0, 3);
+
+    ptls_buffer_dispose(&cbuf);
+    ptls_buffer_dispose(&sbuf);
+    epoch_test_env_dispose(&env);
+}
+
+/**
+ * Replays handshake messages that have already been consumed. Asserts that the caller cannot obtain a key of a level that has not
+ * been reached (including by claiming a future epoch), and that a replay neither advances `ptls_get_read_epoch` /
+ * `ptls_handshake_is_complete` nor installs an additional key.
+ */
+static void test_handshake_api_epoch_replay(void)
+{
+    struct st_epoch_test_env env;
+    ptls_buffer_t cbuf, sbuf, chbuf, srvflightbuf, flightbuf, cfbuf;
+    size_t coffs[5], soffs[5], sh_len, flight_len, ee_len, rest_len, nkeys;
+    int ret;
+
+    epoch_test_env_init(&env);
+    ptls_buffer_init(&cbuf, "", 0);
+    ptls_buffer_init(&sbuf, "", 0);
+    ptls_buffer_init(&chbuf, "", 0);
+    ptls_buffer_init(&srvflightbuf, "", 0);
+    ptls_buffer_init(&flightbuf, "", 0);
+    ptls_buffer_init(&cfbuf, "", 0);
+
+    ret = feed_single_message(env.client, &cbuf, coffs, 0, NULL, 0, NULL);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(append_bytes(&chbuf, cbuf.base, cbuf.off) == 0);
+
+    ret = feed_single_message(env.server, &sbuf, soffs, 0, chbuf.base, chbuf.off, NULL);
+    ok(ret == 0);
+    ok(ptls_get_read_epoch(env.server) == 2);
+    nkeys = env.server_keys.num_events;
+    ok(nkeys == 3);
+
+    /* keep the server flight, as the negative tests below reuse (and therefore overwrite) the send buffer */
+    ok(append_bytes(&srvflightbuf, sbuf.base, sbuf.off) == 0);
+    sh_len = soffs[1];
+    flight_len = soffs[4] - soffs[2];
+    ok(sh_len != 0 && sh_len == soffs[2]);
+    ok(flight_len > 5);
+    ok(append_bytes(&flightbuf, srvflightbuf.base + soffs[2], flight_len) == 0);
+
+    /* replaying ClientHello at the epoch it arrived in is rejected and installs nothing */
+    ret = feed_single_message(env.server, &sbuf, soffs, 0, chbuf.base, chbuf.off, NULL);
+    ok(ret == PTLS_ALERT_UNEXPECTED_MESSAGE);
+    ok(env.server_keys.num_events == nkeys);
+    ok(ptls_get_read_epoch(env.server) == 2);
+    ok(!ptls_handshake_is_complete(env.server));
+
+    /* the server must not expose the client's application read key by claiming a future epoch */
+    ret = feed_single_message(env.server, &sbuf, soffs, 3, chbuf.base, chbuf.off, NULL);
+    ok(ret == PTLS_ALERT_UNEXPECTED_MESSAGE);
+    ok(env.server_keys.num_events == nkeys);
+    OK_KEY_ABSENT(env.server_keys, 0, 3);
+
+    /* ServerHello advances the client to epoch 2; replaying it does not move the state or install keys again */
+    ret = feed_single_message(env.client, &cbuf, coffs, 0, srvflightbuf.base, sh_len, NULL);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(ptls_get_read_epoch(env.client) == 2);
+    nkeys = env.client_keys.num_events;
+    ok(nkeys == 2);
+    ret = feed_single_message(env.client, &cbuf, coffs, 0, srvflightbuf.base, sh_len, NULL);
+    ok(ret == PTLS_ALERT_UNEXPECTED_MESSAGE);
+    ok(env.client_keys.num_events == nkeys);
+    ok(ptls_get_read_epoch(env.client) == 2);
+    ok(!ptls_handshake_is_complete(env.client));
+    OK_KEY_ABSENT(env.client_keys, 0, 3);
+    OK_KEY_ABSENT(env.client_keys, 1, 3);
+
+    /* neither can the client obtain epoch-3 keys by claiming the epoch that carrying them */
+    ret = feed_single_message(env.client, &cbuf, coffs, 3, flightbuf.base, flightbuf.off, NULL);
+    ok(ret == PTLS_ALERT_UNEXPECTED_MESSAGE);
+    ok(env.client_keys.num_events == nkeys);
+    OK_KEY_ABSENT(env.client_keys, 0, 3);
+    OK_KEY_ABSENT(env.client_keys, 1, 3);
+
+    /* consume EncryptedExtensions on its own, then replay it within the same epoch */
+    ok(flightbuf.off >= 5);
+    ok(flightbuf.base[0] == PTLS_HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS);
+    ee_len = PTLS_HANDSHAKE_HEADER_SIZE + (size_t)ntoh24(flightbuf.base + 1);
+    ok(ee_len < flightbuf.off);
+    ret = feed_single_message(env.client, &cbuf, coffs, 2, flightbuf.base, ee_len, NULL);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(ptls_get_read_epoch(env.client) == 2);
+    ok(env.client_keys.num_events == nkeys);
+    ret = feed_single_message(env.client, &cbuf, coffs, 2, flightbuf.base, ee_len, NULL);
+    ok(ret == PTLS_ALERT_UNEXPECTED_MESSAGE);
+    ok(env.client_keys.num_events == nkeys);
+    ok(ptls_get_read_epoch(env.client) == 2);
+    ok(!ptls_handshake_is_complete(env.client));
+
+    /* the replayed message did not corrupt the state; the rest of the flight still completes the handshake */
+    rest_len = flightbuf.off - ee_len;
+    ret = feed_single_message(env.client, &cbuf, coffs, 2, flightbuf.base + ee_len, rest_len, NULL);
+    ok(ret == 0);
+    ok(ptls_handshake_is_complete(env.client));
+    ok(ptls_get_read_epoch(env.client) == 3);
+    ok(env.client_keys.num_events == 4);
+    OK_KEY_INSTALLED(env.client_keys, 0, 3);
+    OK_KEY_INSTALLED(env.client_keys, 1, 3);
+    OK_KEY_MATCH(env.client_keys, 0, 3, env.server_keys, 1, 3);
+
+    ok(append_bytes(&cfbuf, cbuf.base, cbuf.off) == 0);
+
+    /* replaying the entire server flight after the handshake completed is rejected */
+    nkeys = env.client_keys.num_events;
+    ret = feed_single_message(env.client, &cbuf, coffs, 2, flightbuf.base, flightbuf.off, NULL);
+    ok(ret == PTLS_ALERT_UNEXPECTED_MESSAGE);
+    ok(env.client_keys.num_events == nkeys);
+    ok(ptls_handshake_is_complete(env.client));
+    ok(ptls_get_read_epoch(env.client) == 3);
+
+    ret = feed_single_message(env.server, &sbuf, soffs, 2, cfbuf.base, cfbuf.off, NULL);
+    ok(ret == 0);
+    ok(ptls_handshake_is_complete(env.server));
+    ok(ptls_get_read_epoch(env.server) == 3);
+    ok(env.server_keys.num_events == 4);
+    OK_KEY_INSTALLED(env.server_keys, 0, 3);
+    OK_KEY_MATCH(env.client_keys, 1, 3, env.server_keys, 0, 3);
+
+    /* replaying ClientFinished is rejected and does not allocate another key */
+    nkeys = env.server_keys.num_events;
+    ret = feed_single_message(env.server, &sbuf, soffs, 2, cfbuf.base, cfbuf.off, NULL);
+    ok(ret == PTLS_ALERT_UNEXPECTED_MESSAGE);
+    ok(env.server_keys.num_events == nkeys);
+    ok(ptls_handshake_is_complete(env.server));
+    ok(ptls_get_read_epoch(env.server) == 3);
+
+    /* no key has been installed twice, in either direction */
+    for (int is_enc = 0; is_enc != 2; ++is_enc) {
+        for (size_t epoch = 1; epoch != 4; ++epoch) {
+            ok(test_traffic_key_log_count(&env.client_keys, is_enc, epoch) <= 1);
+            ok(test_traffic_key_log_count(&env.server_keys, is_enc, epoch) <= 1);
+        }
+    }
+    ok(env.client_keys.num_events == 4);
+    ok(env.server_keys.num_events == 4);
+
+    ptls_buffer_dispose(&cbuf);
+    ptls_buffer_dispose(&sbuf);
+    ptls_buffer_dispose(&chbuf);
+    ptls_buffer_dispose(&srvflightbuf);
+    ptls_buffer_dispose(&flightbuf);
+    ptls_buffer_dispose(&cfbuf);
+    epoch_test_env_dispose(&env);
+}
+
 static void test_all_handshakes_core(void)
 {
     subtest("full-handshake", test_full_handshake);
@@ -3098,6 +3584,9 @@ static void test_all_handshakes_core(void)
     subtest("key-update", test_key_update);
     subtest("pre-shared-key", test_pre_shared_key);
     subtest("handshake-api", test_handshake_api);
+    subtest("handshake-api-epoch-transitions", test_handshake_api_epoch_transitions);
+    subtest("handshake-api-epoch-order", test_handshake_api_epoch_order);
+    subtest("handshake-api-epoch-replay", test_handshake_api_epoch_replay);
 }
 
 static void test_all_handshakes(void)
