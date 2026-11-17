@@ -1676,6 +1676,499 @@ static void test_hrr_cipher_suite_mismatch(void)
     ctx_peer->cipher_suites = server_cipher_suites_orig;
 }
 
+/**
+ * Feeds `input` to the handshake, either as a single chunk or byte-by-byte. When feeding byte-by-byte, every byte is
+ * expected to be consumed, and all calls but the one that completes the stage are expected to return
+ * PTLS_ERROR_IN_PROGRESS. Returns the return value of the last call.
+ */
+static int feed_handshake(ptls_t *tls, ptls_buffer_t *sendbuf, const uint8_t *input, size_t len,
+                          ptls_handshake_properties_t *props, int fragmented)
+{
+    int ret;
+
+    if (!fragmented) {
+        size_t consumed = len;
+        ret = ptls_handshake(tls, sendbuf, input, &consumed, props);
+        ok(consumed == len);
+    } else {
+        size_t off = 0;
+        int consumed_all = 1;
+        ret = PTLS_ERROR_IN_PROGRESS;
+        while (off < len) {
+            size_t consumed = 1;
+            ret = ptls_handshake(tls, sendbuf, input + off, &consumed, props);
+            if (consumed != 1)
+                consumed_all = 0;
+            off += consumed;
+            if (ret != PTLS_ERROR_IN_PROGRESS || consumed == 0)
+                break;
+        }
+        ok(consumed_all);
+        ok(off == len);
+    }
+
+    return ret;
+}
+
+/**
+ * Traffic keys are derived from the transcript hash (CH1 .. HRR .. CH2 .. SH .. Finished) and the ECDH shared secret.
+ * Their equality on both peers proves that the two ends share the same view of the entire exchange, including the
+ * retried ClientHello and the key share.
+ */
+static void check_peer_traffic_keys_match(ptls_t *client, ptls_t *server)
+{
+    struct {
+        uint8_t key[PTLS_MAX_SECRET_SIZE];
+        uint8_t iv[PTLS_MAX_IV_SIZE];
+        uint64_t seq;
+    } c_enc = {0}, c_dec = {0}, s_enc = {0}, s_dec = {0};
+
+    ok(ptls_get_traffic_keys(client, 1, c_enc.key, c_enc.iv, &c_enc.seq) == 0);
+    ok(ptls_get_traffic_keys(client, 0, c_dec.key, c_dec.iv, &c_dec.seq) == 0);
+    ok(ptls_get_traffic_keys(server, 1, s_enc.key, s_enc.iv, &s_enc.seq) == 0);
+    ok(ptls_get_traffic_keys(server, 0, s_dec.key, s_dec.iv, &s_dec.seq) == 0);
+
+    ok(c_enc.seq == s_dec.seq);
+    ok(memcmp(c_enc.key, s_dec.key, PTLS_MAX_SECRET_SIZE) == 0);
+    ok(memcmp(c_enc.iv, s_dec.iv, PTLS_MAX_IV_SIZE) == 0);
+    ok(s_enc.seq == c_dec.seq);
+    ok(memcmp(s_enc.key, c_dec.key, PTLS_MAX_SECRET_SIZE) == 0);
+    ok(memcmp(s_enc.iv, c_dec.iv, PTLS_MAX_IV_SIZE) == 0);
+}
+
+/**
+ * Runs a full handshake that involves HRR (the first ClientHello carries no key share), checking at each stage that the
+ * state machine advances as expected, and at the end that the transcript, the key share, and the Finished messages are
+ * bound together: both peers must agree on the cipher suite named by the HRR, the negotiated group, and the traffic
+ * keys, and application data must flow in both directions. When `fragmented` is set, every flight is fed byte-by-byte.
+ */
+static void do_test_hrr_transcript_binding(int fragmented)
+{
+    ptls_cipher_suite_t **client_cipher_suites_orig = ctx->cipher_suites, **server_cipher_suites_orig = ctx_peer->cipher_suites;
+    ptls_cipher_suite_t *client_cipher_suites[] = {find_cipher(ctx, PTLS_CIPHER_SUITE_AES_128_GCM_SHA256),
+                                                   find_cipher(ctx, PTLS_CIPHER_SUITE_AES_256_GCM_SHA384), NULL};
+    ptls_cipher_suite_t *server_cipher_suites[] = {find_cipher(ctx_peer, PTLS_CIPHER_SUITE_AES_256_GCM_SHA384),
+                                                   find_cipher(ctx_peer, PTLS_CIPHER_SUITE_AES_128_GCM_SHA256), NULL};
+    ptls_t *client, *server;
+    ptls_handshake_properties_t client_hs_prop = {{{{NULL}}}};
+    ptls_buffer_t cbuf, sbuf, decbuf;
+    uint8_t cbuf_small[16384], sbuf_small[16384], decbuf_small[16384];
+    size_t ch1_len, cipher_off;
+    uint16_t hrr_cipher;
+    const char *req = "GET / HTTP/1.0\r\n\r\n";
+    size_t consumed;
+    int ret;
+
+    if (client_cipher_suites[0] == NULL || client_cipher_suites[1] == NULL || server_cipher_suites[0] == NULL ||
+        server_cipher_suites[1] == NULL) {
+        note("skipping test because the backend does not provide both sha256 and sha384 TLS 1.3 cipher suites");
+        return;
+    }
+
+    /* Let HRR select the cipher suite, using server preference so that the outcome is deterministic. When the client and
+     * the server use different contexts, the client prefers AES_128_GCM_SHA256 while the server selects
+     * AES_256_GCM_SHA384, thereby also switching the transcript hash algorithm at HRR. */
+    unsigned server_cipher_preference_orig = ctx_peer->server_cipher_preference;
+    ctx->cipher_suites = client_cipher_suites;
+    ctx_peer->cipher_suites = server_cipher_suites;
+    ctx_peer->server_cipher_preference = 1;
+
+    client_hs_prop.client.negotiate_before_key_exchange = 1;
+
+    client = ptls_new(ctx, 0);
+    server = ptls_new(ctx_peer, 1);
+    ptls_buffer_init(&cbuf, cbuf_small, sizeof(cbuf_small));
+    ptls_buffer_init(&sbuf, sbuf_small, sizeof(sbuf_small));
+    ptls_buffer_init(&decbuf, decbuf_small, sizeof(decbuf_small));
+
+    /* first flight: ClientHello without a key share */
+    ret = ptls_handshake(client, &cbuf, NULL, NULL, &client_hs_prop);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(cbuf.off != 0);
+    ch1_len = cbuf.off;
+
+    /* CH1 -> HRR */
+    ret = feed_handshake(server, &sbuf, cbuf.base, cbuf.off, NULL, fragmented);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    cbuf.off = 0;
+
+    /* the response is an HRR: a ServerHello carrying the special random */
+    ok(sbuf.off > 5 + PTLS_HANDSHAKE_HEADER_SIZE + 2 + PTLS_HELLO_RANDOM_SIZE);
+    ok(sbuf.base[0] == PTLS_CONTENT_TYPE_HANDSHAKE);
+    ok(sbuf.base[5] == PTLS_HANDSHAKE_TYPE_SERVER_HELLO);
+    ok(memcmp(sbuf.base + 5 + PTLS_HANDSHAKE_HEADER_SIZE + 2, hello_retry_random, PTLS_HELLO_RANDOM_SIZE) == 0);
+
+    /* the HRR names the cipher suite preferred by the server */
+    cipher_off = calc_server_hello_cipher_suite_offset(&sbuf);
+    hrr_cipher = (uint16_t)((sbuf.base[cipher_off] << 8) | sbuf.base[cipher_off + 1]);
+    ok(hrr_cipher == PTLS_CIPHER_SUITE_AES_256_GCM_SHA384);
+
+    /* HRR -> second ClientHello */
+    ret = feed_handshake(client, &cbuf, sbuf.base, sbuf.off, &client_hs_prop, fragmented);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    sbuf.off = 0;
+
+    /* the second ClientHello differs from the first: it now carries a key share */
+    ok(cbuf.off != 0);
+    ok(cbuf.off != ch1_len);
+
+    /* CH2 -> server flight (SH .. Finished) */
+    ret = feed_handshake(server, &sbuf, cbuf.base, cbuf.off, NULL, fragmented);
+    ok(ret == 0);
+    cbuf.off = 0;
+
+    /* server flight -> client Finished */
+    ret = feed_handshake(client, &cbuf, sbuf.base, sbuf.off, NULL, fragmented);
+    ok(ret == 0);
+    ok(ptls_handshake_is_complete(client));
+    ok(!ptls_handshake_is_complete(server));
+    sbuf.off = 0;
+
+    /* client Finished -> server completes */
+    ret = feed_handshake(server, &sbuf, cbuf.base, cbuf.off, NULL, fragmented);
+    ok(ret == 0);
+    ok(ptls_handshake_is_complete(server));
+    cbuf.off = 0;
+
+    /* both ends agree on the algorithm selected via HRR and on the key share */
+    ok(ptls_get_cipher(client) != NULL);
+    ok(ptls_get_cipher(client)->id == hrr_cipher);
+    ok(ptls_get_cipher(server) != NULL);
+    ok(ptls_get_cipher(server)->id == hrr_cipher);
+    ok(ptls_get_negotiated_group(client) == ctx_peer->key_exchanges[0]->id);
+    ok(ptls_get_negotiated_group(server) == ctx_peer->key_exchanges[0]->id);
+
+    check_peer_traffic_keys_match(client, server);
+
+    /* a legal retry remains interoperable: application data flows in both directions */
+    ret = ptls_send(client, &cbuf, req, strlen(req));
+    ok(ret == 0);
+    consumed = cbuf.off;
+    ret = ptls_receive(server, &decbuf, cbuf.base, &consumed);
+    ok(ret == 0);
+    ok(consumed == cbuf.off);
+    ok(decbuf.off == strlen(req));
+    ok(memcmp(decbuf.base, req, decbuf.off) == 0);
+    cbuf.off = 0;
+    decbuf.off = 0;
+
+    ret = ptls_send(server, &sbuf, req, strlen(req));
+    ok(ret == 0);
+    consumed = sbuf.off;
+    ret = ptls_receive(client, &decbuf, sbuf.base, &consumed);
+    ok(ret == 0);
+    ok(consumed == sbuf.off);
+    ok(decbuf.off == strlen(req));
+    ok(memcmp(decbuf.base, req, decbuf.off) == 0);
+    sbuf.off = 0;
+    decbuf.off = 0;
+
+    ptls_buffer_dispose(&decbuf);
+    ptls_buffer_dispose(&sbuf);
+    ptls_buffer_dispose(&cbuf);
+    ptls_free(server);
+    ptls_free(client);
+    ctx->cipher_suites = client_cipher_suites_orig;
+    ctx_peer->cipher_suites = server_cipher_suites_orig;
+    ctx_peer->server_cipher_preference = server_cipher_preference_orig;
+}
+
+/**
+ * A second HelloRetryRequest must be rejected: once the client has answered a retry, it expects the second ServerHello
+ * and must not re-enter the retry path (which would inherit state trusted during the first flight).
+ */
+static void test_hrr_second_hrr_rejected(void)
+{
+    ptls_t *client, *server;
+    ptls_handshake_properties_t client_hs_prop = {{{{NULL}}}};
+    ptls_buffer_t cbuf, sbuf;
+    uint8_t cbuf_small[16384], sbuf_small[16384];
+    uint8_t *hrr_copy;
+    size_t hrr_len, consumed;
+    int ret;
+
+    client_hs_prop.client.negotiate_before_key_exchange = 1;
+
+    client = ptls_new(ctx, 0);
+    server = ptls_new(ctx_peer, 1);
+    ptls_buffer_init(&cbuf, cbuf_small, sizeof(cbuf_small));
+    ptls_buffer_init(&sbuf, sbuf_small, sizeof(sbuf_small));
+
+    ret = ptls_handshake(client, &cbuf, NULL, NULL, &client_hs_prop);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(cbuf.off != 0);
+
+    consumed = cbuf.off;
+    ret = ptls_handshake(server, &sbuf, cbuf.base, &consumed, NULL);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(consumed == cbuf.off);
+    cbuf.off = 0;
+
+    /* stash the HRR */
+    hrr_len = sbuf.off;
+    hrr_copy = malloc(hrr_len);
+    memcpy(hrr_copy, sbuf.base, hrr_len);
+
+    /* the first HRR is accepted and the second ClientHello is emitted */
+    consumed = sbuf.off;
+    ret = ptls_handshake(client, &cbuf, sbuf.base, &consumed, &client_hs_prop);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(consumed == sbuf.off);
+    ok(cbuf.off != 0);
+    sbuf.off = 0;
+    cbuf.off = 0;
+
+    /* a duplicate HRR must fail precisely at this stage */
+    consumed = hrr_len;
+    ret = ptls_handshake(client, &cbuf, hrr_copy, &consumed, NULL);
+    ok(ret == PTLS_ALERT_UNEXPECTED_MESSAGE);
+    ok(!ptls_handshake_is_complete(client));
+
+    free(hrr_copy);
+    ptls_buffer_dispose(&sbuf);
+    ptls_buffer_dispose(&cbuf);
+    ptls_free(server);
+    ptls_free(client);
+}
+
+/**
+ * HRR that carries the same extension twice has to be rejected.
+ */
+static void test_hrr_duplicate_extension(void)
+{
+    /* supported_versions + key_share(secp256r1) + key_share(secp384r1) */
+    static const uint8_t hrr[] = {0x16, 0x03, 0x03, 0x00, 0x3e, 0x02, 0x00, 0x00, 0x3a, 0x03, 0x03, 0xcf, 0x21, 0xad, 0x74,
+                                  0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91, 0xc2, 0xa2, 0x11,
+                                  0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c, 0x00, 0x13,
+                                  0x01, 0x00, 0x00, 0x12, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, 0x00, 0x33, 0x00, 0x02, 0x00,
+                                  0x17, 0x00, 0x33, 0x00, 0x02, 0x00, 0x18};
+
+    do_test_client_handle_hrr(hrr, sizeof(hrr), PTLS_ALERT_ILLEGAL_PARAMETER);
+}
+
+/**
+ * After a legitimate HRR, the second ServerHello must still be fully validated: the trust established by the retry does
+ * not exempt the peer from providing a key share.
+ */
+static void test_hrr_sh2_missing_key_share(void)
+{
+    /* cookie-only HRR (accepted) */
+    static const uint8_t hrr[] = {0x16, 0x03, 0x03, 0x00, 0x3c, 0x02, 0x00, 0x00, 0x38, 0x03, 0x03, 0xcf, 0x21,
+                                  0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8,
+                                  0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2,
+                                  0xc8, 0xa8, 0x33, 0x9c, 0x00, 0x13, 0x01, 0x00, 0x00, 0x10, 0x00, 0x2b, 0x00,
+                                  0x02, 0x03, 0x04, 0x00, 0x2c, 0x00, 0x06, 0x00, 0x04, 0xde, 0xad, 0xbe, 0xef};
+    /* second ServerHello carrying supported_versions only (no key_share) */
+    static const uint8_t sh2[] = {0x16, 0x03, 0x03, 0x00, 0x32, 0x02, 0x00, 0x00, 0x2e, 0x03, 0x03, 0x20, 0x21, 0x22,
+                                  0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+                                  0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e,
+                                  0x3f, 0x00, 0x13, 0x01, 0x00, 0x00, 0x06, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04};
+
+    ok(ctx->key_exchanges[0]->id == PTLS_GROUP_SECP256R1);
+    ptls_key_exchange_algorithm_t **key_exchanges_orig = ctx->key_exchanges, *key_exchanges[] = {ctx->key_exchanges[0], NULL};
+    ctx->key_exchanges = key_exchanges;
+
+    ptls_cipher_suite_t **cipher_suites_orig = ctx->cipher_suites,
+                        *cipher_suites[] = {find_cipher(ctx, PTLS_CIPHER_SUITE_AES_128_GCM_SHA256), NULL};
+    ctx->cipher_suites = cipher_suites;
+
+    unsigned send_change_cipher_spec_orig = ctx->send_change_cipher_spec;
+    ctx->send_change_cipher_spec = 0;
+
+    ptls_t *client;
+    ptls_buffer_t cbuf;
+    uint8_t cbuf_small[16384];
+    size_t consumed;
+    int ret;
+
+    client = ptls_new(ctx, 0);
+    ptls_buffer_init(&cbuf, cbuf_small, sizeof(cbuf_small));
+
+    ret = ptls_handshake(client, &cbuf, NULL, NULL, NULL);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(cbuf.off != 0);
+    cbuf.off = 0;
+
+    /* the legitimate HRR is accepted and the second ClientHello is emitted */
+    consumed = sizeof(hrr);
+    ret = ptls_handshake(client, &cbuf, hrr, &consumed, NULL);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(consumed == sizeof(hrr));
+    ok(cbuf.off != 0);
+    cbuf.off = 0;
+
+    /* the second ServerHello without a key share must be rejected precisely at this stage */
+    consumed = sizeof(sh2);
+    ret = ptls_handshake(client, &cbuf, sh2, &consumed, NULL);
+    ok(ret == PTLS_ALERT_ILLEGAL_PARAMETER);
+    ok(!ptls_handshake_is_complete(client));
+
+    ptls_buffer_dispose(&cbuf);
+    ptls_free(client);
+
+    ctx->key_exchanges = key_exchanges_orig;
+    ctx->cipher_suites = cipher_suites_orig;
+    ctx->send_change_cipher_spec = send_change_cipher_spec_orig;
+}
+
+/**
+ * In middlebox-compat mode the client sends a random 32-byte legacy_session_id; an HRR that does not echo it must be
+ * rejected, i.e., a retry does not skip parameter validation.
+ */
+static void test_hrr_session_id_mismatch(void)
+{
+    /* cookie-only HRR with an empty legacy_session_id */
+    static const uint8_t hrr[] = {0x16, 0x03, 0x03, 0x00, 0x3c, 0x02, 0x00, 0x00, 0x38, 0x03, 0x03, 0xcf, 0x21,
+                                  0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8,
+                                  0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2,
+                                  0xc8, 0xa8, 0x33, 0x9c, 0x00, 0x13, 0x01, 0x00, 0x00, 0x10, 0x00, 0x2b, 0x00,
+                                  0x02, 0x03, 0x04, 0x00, 0x2c, 0x00, 0x06, 0x00, 0x04, 0xde, 0xad, 0xbe, 0xef};
+
+    ok(ctx->key_exchanges[0]->id == PTLS_GROUP_SECP256R1);
+    ptls_key_exchange_algorithm_t **key_exchanges_orig = ctx->key_exchanges, *key_exchanges[] = {ctx->key_exchanges[0], NULL};
+    ctx->key_exchanges = key_exchanges;
+
+    ptls_cipher_suite_t **cipher_suites_orig = ctx->cipher_suites,
+                        *cipher_suites[] = {find_cipher(ctx, PTLS_CIPHER_SUITE_AES_128_GCM_SHA256), NULL};
+    ctx->cipher_suites = cipher_suites;
+
+    unsigned send_change_cipher_spec_orig = ctx->send_change_cipher_spec;
+    ctx->send_change_cipher_spec = 1;
+
+    ptls_t *client;
+    ptls_buffer_t cbuf;
+    uint8_t cbuf_small[16384];
+    size_t consumed;
+    int ret;
+
+    client = ptls_new(ctx, 0);
+    ptls_buffer_init(&cbuf, cbuf_small, sizeof(cbuf_small));
+
+    ret = ptls_handshake(client, &cbuf, NULL, NULL, NULL);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(cbuf.off != 0);
+    cbuf.off = 0;
+
+    /* the HRR carries an empty legacy_session_id, which does not match the random one sent in the ClientHello */
+    consumed = sizeof(hrr);
+    ret = ptls_handshake(client, &cbuf, hrr, &consumed, NULL);
+    ok(ret == PTLS_ALERT_ILLEGAL_PARAMETER);
+    ok(consumed == sizeof(hrr));
+    ok(!ptls_handshake_is_complete(client));
+
+    ptls_buffer_dispose(&cbuf);
+    ptls_free(client);
+
+    ctx->key_exchanges = key_exchanges_orig;
+    ctx->cipher_suites = cipher_suites_orig;
+    ctx->send_change_cipher_spec = send_change_cipher_spec_orig;
+}
+
+/**
+ * Locates the first byte of the cookie value carried by an HRR record, or returns SIZE_MAX.
+ */
+static size_t find_hrr_cookie_offset(const uint8_t *rec, size_t len)
+{
+    const uint8_t *src, *end;
+
+    if (!(len > 5 + PTLS_HANDSHAKE_HEADER_SIZE + 2 + PTLS_HELLO_RANDOM_SIZE + 1 && rec[0] == PTLS_CONTENT_TYPE_HANDSHAKE &&
+          rec[5] == PTLS_HANDSHAKE_TYPE_SERVER_HELLO))
+        return SIZE_MAX;
+
+    src = rec + 5 + PTLS_HANDSHAKE_HEADER_SIZE + 2 + PTLS_HELLO_RANDOM_SIZE;
+    end = rec + len;
+    src += 1 + *src; /* legacy_session_id */
+    if (end - src < 2 + 1 + 2)
+        return SIZE_MAX;
+    src += 2 + 1; /* cipher_suite, legacy_compression_method */
+    { /* extensions */
+        size_t ext_len = (size_t)((src[0] << 8) | src[1]);
+        src += 2;
+        if (ext_len > (size_t)(end - src))
+            return SIZE_MAX;
+        end = src + ext_len;
+    }
+    while (end - src >= 4) {
+        uint16_t exttype = (uint16_t)((src[0] << 8) | src[1]);
+        size_t ext_len = (size_t)((src[2] << 8) | src[3]);
+        src += 4;
+        if (ext_len > (size_t)(end - src))
+            return SIZE_MAX;
+        if (exttype == PTLS_EXTENSION_TYPE_COOKIE && ext_len >= 3)
+            return (size_t)(src - rec) + 2; /* cookie value is a 2-byte length-prefixed block */
+        src += ext_len;
+    }
+    return SIZE_MAX;
+}
+
+/**
+ * Tampering with the HRR in transit must not go unnoticed: the cookie echoed in the second ClientHello enters the
+ * transcript on both ends, the transcripts diverge, and with them the handshake traffic keys. The client therefore
+ * fails to authenticate the server's flight precisely at that stage — an illegal retry cannot inherit the trust
+ * established by the original first flight.
+ */
+static void test_hrr_tampered_transcript(void)
+{
+    ptls_t *client, *server;
+    ptls_handshake_properties_t server_hs_prop = {{{{NULL}}}};
+    ptls_buffer_t cbuf, sbuf;
+    uint8_t cbuf_small[16384], sbuf_small[16384];
+    size_t consumed, cookie_off;
+    int ret;
+
+    /* stateful retry; the HRR carries a one-byte cookie that the client is required to echo */
+    server_hs_prop.server.enforce_retry = 1;
+
+    client = ptls_new(ctx, 0);
+    server = ptls_new(ctx_peer, 1);
+    ptls_buffer_init(&cbuf, cbuf_small, sizeof(cbuf_small));
+    ptls_buffer_init(&sbuf, sbuf_small, sizeof(sbuf_small));
+
+    ret = ptls_handshake(client, &cbuf, NULL, NULL, NULL);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(cbuf.off != 0);
+
+    consumed = cbuf.off;
+    ret = ptls_handshake(server, &sbuf, cbuf.base, &consumed, &server_hs_prop);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(consumed == cbuf.off);
+    cbuf.off = 0;
+
+    /* confirm that the response is an HRR and tamper with the cookie value */
+    ok(sbuf.off > 5 + PTLS_HANDSHAKE_HEADER_SIZE + 2 + PTLS_HELLO_RANDOM_SIZE);
+    ok(memcmp(sbuf.base + 5 + PTLS_HANDSHAKE_HEADER_SIZE + 2, hello_retry_random, PTLS_HELLO_RANDOM_SIZE) == 0);
+    cookie_off = find_hrr_cookie_offset(sbuf.base, sbuf.off);
+    ok(cookie_off != SIZE_MAX);
+    sbuf.base[cookie_off] ^= 0xff;
+
+    /* the cookie is opaque to the client: the tampered HRR is accepted and the second ClientHello echoes it */
+    consumed = sbuf.off;
+    ret = ptls_handshake(client, &cbuf, sbuf.base, &consumed, NULL);
+    ok(ret == PTLS_ERROR_IN_PROGRESS);
+    ok(consumed == sbuf.off);
+    ok(cbuf.off != 0);
+    sbuf.off = 0;
+
+    /* the stateful server does not compare the echoed cookie; it concludes its side of the handshake */
+    consumed = cbuf.off;
+    ret = ptls_handshake(server, &sbuf, cbuf.base, &consumed, &server_hs_prop);
+    ok(ret == 0);
+    ok(consumed == cbuf.off);
+    cbuf.off = 0;
+
+    /* but the transcripts (and hence the handshake traffic keys) have diverged: the client must fail to authenticate
+     * the server's encrypted flight precisely at this stage */
+    consumed = sbuf.off;
+    ret = ptls_handshake(client, &cbuf, sbuf.base, &consumed, NULL);
+    ok(ret == PTLS_ALERT_BAD_RECORD_MAC);
+    ok(!ptls_handshake_is_complete(client));
+
+    ptls_buffer_dispose(&sbuf);
+    ptls_buffer_dispose(&cbuf);
+    ptls_free(server);
+    ptls_free(client);
+}
+
 static int on_copy_ticket(ptls_encrypt_ticket_t *self, ptls_t *tls, int is_encrypt, ptls_buffer_t *dst, ptls_iovec_t src);
 static int on_save_ticket(ptls_save_ticket_t *self, ptls_t *tls, ptls_iovec_t src, const ptls_save_ticket_properties_t *properties);
 static ptls_iovec_t saved_tickets[8];
@@ -3536,6 +4029,13 @@ void test_picotls(void)
     subtest("hrr-selected-group-ffff", test_hrr_invalid_selected_group, 0xffff);
     subtest("hrr-without-change", test_hrr_without_change);
     subtest("hrr-cookie-only", test_hrr_cookie_only);
+    subtest("hrr-transcript-binding", do_test_hrr_transcript_binding, 0);
+    subtest("hrr-transcript-binding-fragmented", do_test_hrr_transcript_binding, 1);
+    subtest("hrr-second-hrr-rejected", test_hrr_second_hrr_rejected);
+    subtest("hrr-duplicate-extension", test_hrr_duplicate_extension);
+    subtest("hrr-sh2-missing-key-share", test_hrr_sh2_missing_key_share);
+    subtest("hrr-session-id-mismatch", test_hrr_session_id_mismatch);
+    subtest("hrr-tampered-transcript", test_hrr_tampered_transcript);
     subtest("plaintext-alert", test_plaintext_alert);
     subtest("handshake", test_all_handshakes);
     subtest("quic", test_quic);
